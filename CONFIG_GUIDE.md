@@ -66,7 +66,8 @@ Cnki-Mcp/
 ```json
 {
   "timeouts": {
-    "page_goto_timeout": 60000,                // 页面导航超时
+    "page_goto_timeout": 30000,                // 页面导航超时
+    "page_default_timeout": 15000,             // 单个页面操作的默认超时
     "page_load_state_timeout": 5000,           // 页面加载状态等待超时
     "element_visible_timeout": 2000,           // 元素可见性检查超时
     "element_click_timeout": 3000,             // 元素点击超时
@@ -77,6 +78,9 @@ Cnki-Mcp/
   }
 }
 ```
+
+单步等待还会被本次调用的剩余预算再压一层：即使这里配得很大，也不会让某一步把整次调用的预算吃光。
+单次工具调用的总预算固定为 150 秒（浏览器初始化与实际操作共享），该值在代码中维护；MCP 客户端的调用超时应大于它。
 
 ### 3. optimization（优化配置）
 
@@ -90,10 +94,16 @@ Cnki-Mcp/
     "max_retry_attempts": 3,                   // 操作失败时的最大重试次数
     "enable_headless": false,                  // 是否使用无头模式
     "viewport_width": 1920,                    // 浏览器窗口宽度
-    "viewport_height": 1080                    // 浏览器窗口高度
+    "viewport_height": 1080,                   // 浏览器窗口高度
+    "user_data_dir": ""                        // 浏览器持久化资料目录，留空则用 ~/.cnki-mcp/browser-profile
   }
 }
 ```
+
+`user_data_dir` 决定 Cookie 与验证结果落在哪里。留空时使用用户目录下的 `.cnki-mcp/browser-profile`，
+滑块验证只需成功一次，之后重启服务、重启电脑都不用再验；指向不可写目录会让每次都像新会话一样被要求验证。
+同一目录同时只能被一个进程使用，若有其他知网检索进程在跑，先关掉再启动。
+该目录等于一个浏览器用户资料目录，可能包含知网登录状态，不要拷贝给别人或提交到仓库。
 
 ### 4. detection（检测配置）
 
@@ -109,6 +119,24 @@ Cnki-Mcp/
   }
 }
 ```
+
+### 5. captcha（验证码配置）
+
+```json
+{
+  "captcha": {
+    "auto_verify": true,                       // 是否启用自动滑块验证
+    "max_retry": 3,                            // 自动验证最大重试次数
+    "drag_duration": 0.5,                      // 拖拽总时长（秒）
+    "verify_method": "iou"                     // 验证方法：iou / ssim / addition
+  }
+}
+```
+
+自动验证失败后不会一直等人工操作：调用会立刻失败并返回「请在已打开的浏览器窗口中手动完成滑块验证后重试」。
+这样做是因为等待期间浏览器线程被独占，调用方只能等到超时，后续调用还会继续排队。
+手动完成一次后，验证结果会保存在 `user_data_dir` 中，后续调用不再重复验证。
+实际重试次数还会按本次调用的剩余预算自动裁剪，不会把预算全部花在验证上。
 
 ## 常见优化场景
 

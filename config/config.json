@@ -64,8 +64,11 @@
   
   "timeouts": {
     "description": "各种操作的超时时间配置（单位：毫秒）",
-    "page_goto_timeout": 60000,
+    "page_goto_timeout": 30000,
     "comment_page_goto_timeout": "页面导航超时",
+    
+    "page_default_timeout": 15000,
+    "comment_page_default_timeout": "单个页面操作的默认超时，避免一步等待吃满整个调用预算",
     
     "page_load_state_timeout": 5000,
     "comment_page_load_state_timeout": "页面加载状态等待超时",
@@ -105,7 +108,10 @@
     
     "viewport_width": 1920,
     "viewport_height": 1080,
-    "comment_viewport": "浏览器窗口大小"
+    "comment_viewport": "浏览器窗口大小",
+    
+    "user_data_dir": "",
+    "comment_user_data_dir": "浏览器持久化资料目录，留空则使用 ~/.cnki-mcp/browser-profile。Cookie 与验证结果保存在这里，服务重启后无需重新过滑块验证"
   },
   
   "detection": {
@@ -127,8 +133,8 @@
     "description": "验证码处理相关配置",
     "auto_verify": true,
     "comment_auto_verify": "是否启用自动验证码验证",
-    "max_retry": 10,
-    "comment_max_retry": "自动验证最大重试次数",
+    "max_retry": 3,
+    "comment_max_retry": "自动验证最大重试次数；超过后不再等待，直接把「需要人工完成滑块」作为失败结果返回",
     "drag_duration": 0.5,
     "comment_drag_duration": "拖拽总时长（秒），模拟人类操作速度，建议1.0-1.5秒",
     "verify_method": "iou",
@@ -141,12 +147,14 @@
       "如果操作太慢，尝试减少 browser_slow_mo 值",
       "如果搜索无结果，尝试设置 clear_cache_on_init 为 true",
       "如果页面加载超时，增加相应的 timeout 值",
-      "所有延迟时间都支持动态调整，无需重启服务"
+      "所有延迟时间都支持动态调整，无需重启服务",
+      "反复要求滑块验证时，检查 user_data_dir 指向的目录是否可写；验证结果保存在该目录中"
     ],
     "known_issues": [
       "知网可能存在检测机制，长周期任务可能导致搜索无结果",
       "清空浏览器缓存后通常可以恢复正常",
-      "某些操作间隔过短可能被识别为自动化操作"
+      "某些操作间隔过短可能被识别为自动化操作",
+      "自动验证失败时不会一直等待人工操作，而是返回失败提示：请在已打开的浏览器窗口手动完成滑块后重试"
     ]
   }
 }

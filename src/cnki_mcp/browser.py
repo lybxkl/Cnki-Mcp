@@ -5,10 +5,12 @@ import random
 import atexit
 import sys
 import re
+import builtins
+from pathlib import Path
 from typing import Optional
 from threading import Lock
 
-from playwright.sync_api import sync_playwright, Browser, Page, TimeoutError, Playwright
+from playwright.sync_api import sync_playwright, BrowserContext, Page, TimeoutError, Playwright
 
 from .models import CNKIQueryRequest, CNKIQueryResult, CNKIPaper, SEARCH_TYPE_NAMES, SearchType, PageState, InitState
 from .config import ConfigManager, get_captcha
@@ -40,9 +42,28 @@ def safe_print(msg: str):
             sys.stderr.flush()
 
 
+class DeadlineExceeded(builtins.TimeoutError):
+    """浏览器线程内的协作式截止时间到期。
+
+    服务端 asyncio.wait_for 无法取消已在执行的线程，超时后线程会继续占用唯一的
+    Playwright 线程，把后续调用一起拖到预算耗尽。这里让线程内的循环自己发现预算
+    用完并立刻返回，从而及时释放线程。必须继承内建 TimeoutError（本模块的
+    TimeoutError 名字已被 Playwright 的同名异常占用），才能被服务端的超时分支捕获。
+    """
+
+    pass
+
+
 class CNKIBrowser:
     BASE_URL = "https://kns.cnki.net/"
     SEARCH_URL = "https://kns.cnki.net/kns8s/search"
+
+    # 检索框与检索按钮的候选选择器：新版检索页用 input.search-input / input.search-btn，
+    # 旧版首页用 #txt_search，按顺序取第一个命中的
+    SEARCH_BOX_SELECTORS = "input.search-input, #txt_search, #txt_SearchText"
+    SEARCH_BTN_SELECTORS = "input.search-btn, .search-btn, #btnSearch"
+    # 知网「无结果」提示的候选选择器
+    NO_RESULT_SELECTORS = "p.no-content, .tips-nodata, .no-result"
     
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     
@@ -55,6 +76,7 @@ class CNKIBrowser:
     CAPTCHA_SELECTORS = [
         # 腾讯云验证码选择器（知网新版）
         ".tencent-captcha-dy__container",
+        "#tcaptcha_transform_dy",
         # 旧版知网验证码选择器
         ".verifybox",
         ".verify-img-panel",
@@ -98,9 +120,11 @@ class CNKIBrowser:
         CNKIBrowser._initialized = True
         
         self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._ready: bool = False
+        # 本次调用的截止时间（time.monotonic 基准），None 表示不设预算
+        self._deadline: Optional[float] = None
         
         atexit.register(self._cleanup)
 
@@ -110,8 +134,51 @@ class CNKIBrowser:
             cls._instance = cls()
         return cls._instance
 
+    def set_deadline(self, budget_sec: Optional[float]):
+        """设置本次调用的协作式截止时间；None 表示清除预算"""
+        if budget_sec is None:
+            self._deadline = None
+        else:
+            self._deadline = time.monotonic() + max(budget_sec, 0)
+
+    def _remaining(self) -> Optional[float]:
+        """距离截止时间的剩余秒数，无预算时返回 None"""
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    def _check_deadline(self, stage: str = ""):
+        """预算耗尽时抛出 DeadlineExceeded，让线程尽快交还调用方"""
+        remaining = self._remaining()
+        if remaining is not None and remaining <= 0:
+            raise DeadlineExceeded(f"操作超时：{stage or '当前操作'}已达到调用预算")
+
+    def _bounded_timeout(self, default_ms: int, stage: str = "") -> int:
+        """把 Playwright 的毫秒超时压到剩余预算之内，避免单步等待吃满整个预算"""
+        self._check_deadline(stage)
+        remaining = self._remaining()
+        if remaining is None:
+            return default_ms
+        return max(int(min(default_ms, remaining * 1000)), 1)
+
+    def _resolve_profile_dir(self) -> str:
+        """解析浏览器持久化 profile 目录
+
+        知网对全新会话（无 Cookie）几乎必然弹滑块验证，而验证通过后 Cookie 只活在
+        进程内存里，服务重启又要重验一次。用持久化 profile 把 Cookie 落到磁盘，
+        验证一次即可跨进程复用。
+        """
+        config = ConfigManager.get_instance()
+        raw = str(config.get_optimization('user_data_dir', '') or '').strip()
+        if raw:
+            profile_dir = Path(raw).expanduser()
+        else:
+            profile_dir = Path.home() / '.cnki-mcp' / 'browser-profile'
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return str(profile_dir)
+
     def _init_browser(self) -> Page:
-        if self._page and self._browser:
+        if self._page and self._context:
             try:
                 self._page.evaluate("1")
                 return self._page
@@ -124,35 +191,43 @@ class CNKIBrowser:
         slow_mo = config.get_delay('browser_slow_mo', 100)
         viewport_width = config.get_optimization('viewport_width', 1920)
         viewport_height = config.get_optimization('viewport_height', 1080)
-        page_timeout = config.get_timeout('page_goto_timeout', 60000)
+        page_timeout = config.get_timeout('page_default_timeout', 15000)
         headless = config.get_optimization('enable_headless', False)
+        profile_dir = self._resolve_profile_dir()
 
         safe_print("    [DEBUG] 启动 Playwright...")
         self._playwright = sync_playwright().start()
         
-        safe_print("    [DEBUG] 启动 Chromium...")
-        self._browser = self._playwright.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ],
-            slow_mo=slow_mo
-        )
-        
-        safe_print("    [DEBUG] 创建浏览器上下文...")
-        context = self._browser.new_context(
-            user_agent=self.USER_AGENT,
-            viewport={"width": viewport_width, "height": viewport_height}
-        )
+        safe_print(f"    [DEBUG] 启动 Chromium（持久化 profile：{profile_dir}）...")
+        try:
+            # 持久化上下文：Cookie / localStorage 落盘，重启服务无需重新验证
+            self._context = self._playwright.chromium.launch_persistent_context(
+                profile_dir,
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage"
+                ],
+                slow_mo=slow_mo,
+                user_agent=self.USER_AGENT,
+                viewport={"width": viewport_width, "height": viewport_height}
+            )
+        except Exception as e:
+            self._playwright.stop()
+            self._playwright = None
+            raise Exception(
+                f"启动浏览器失败（profile：{profile_dir}）：{str(e)}。"
+                "若提示 profile 被占用，请关闭其他正在运行知网检索的进程后重试。"
+            )
         
         safe_print("    [DEBUG] 注入反检测脚本...")
-        context.add_init_script(self.ANTI_DETECT_SCRIPT)
+        self._context.add_init_script(self.ANTI_DETECT_SCRIPT)
         
         safe_print("    [DEBUG] 创建新页面...")
-        self._page = context.new_page()
+        # 持久化上下文启动时自带一个空白页，直接复用，避免多开标签页
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
         self._page.set_default_timeout(page_timeout)
         
         safe_print("    [DEBUG] 浏览器初始化完成")
@@ -169,68 +244,150 @@ class CNKIBrowser:
         time.sleep(random.uniform(min_sec, max_sec))
 
     def _check_captcha(self, page: Page) -> bool:
-        """检测页面是否出现验证码
+        """检测页面是否出现「可见」的验证码
+        
+        知网首页始终挂着腾讯验证码 SDK 的隐藏容器（定位在视口之外），只判断元素是否
+        存在会把每次检索都误判成需要验证。这里按实际位置和尺寸判断：宽高大于 0 且
+        左上角落在视口内才算真的弹了验证码。
         
         Returns:
-            bool: 是否检测到验证码
+            bool: 是否检测到可见验证码
         """
-        # 快速检查：先用 count() 判断元素是否存在（不等待）
-        for selector in self.CAPTCHA_SELECTORS:
-            try:
-                count = page.locator(selector).count()
-                if count > 0:
-                    # 元素存在，再检查是否可见
-                    try:
-                        elem = page.locator(selector).first
-                        if elem.is_visible(timeout=500):
-                            safe_print(f"[验证码检测] 发现验证码元素: {selector}")
-                            return True
-                    except Exception:
-                        # 即使不可见，只要元素存在就认为有验证码
-                        safe_print(f"[验证码检测] 发现验证码元素（可能隐藏）: {selector}")
-                        return True
-            except Exception:
-                continue
+        try:
+            matched = page.evaluate(
+                """
+                (selectors) => {
+                    for (const sel of selectors) {
+                        let nodes;
+                        try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
+                        for (const el of nodes) {
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0) {
+                                return sel;
+                            }
+                        }
+                    }
+                    return null;
+                }
+                """,
+                self.CAPTCHA_SELECTORS
+            )
+        except Exception:
+            return False
+        
+        if matched:
+            safe_print(f"[验证码检测] 发现可见验证码元素: {matched}")
+            return True
         
         return False
 
-    def _wait_for_captcha(self, page: Page, max_wait: int = 0):
-        """等待并处理验证码
+    def _any_visible(self, page: Page, selectors: str) -> bool:
+        """用页面内脚本判断候选选择器里是否有可见元素（不等待）
+
+        逐个选择器遍历全部命中节点：只检查第一条命中会漏掉「第一条隐藏、后面可见」
+        的情况（知网同一类提示会同时渲染多份）。
+        """
+        try:
+            return bool(page.evaluate(
+                """
+                (selectors) => selectors.split(',').some(sel => {
+                    let nodes;
+                    try { nodes = document.querySelectorAll(sel.trim()); } catch (e) { return false; }
+                    for (const el of nodes) {
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) return true;
+                    }
+                    return false;
+                })
+                """,
+                selectors
+            ))
+        except Exception:
+            return False
+
+    def _search_box_visible(self, page: Page) -> bool:
+        """检索框是否已就绪（用页面内脚本判定，避免选择器等待叠加超时）"""
+        return self._any_visible(page, self.SEARCH_BOX_SELECTORS)
+
+    def _open_search_page(self, page: Page, stage: str = "打开检索页") -> None:
+        """直连检索页并等待检索框就绪
+        
+        未通过验证的会话会被重定向到滑块验证页，所以先处理验证码再重新打开检索页。
+        检索框始终不出现时立即失败，避免后续每一步都各自等一次超时。
+        
+        Raises:
+            DeadlineExceeded: 本次调用预算耗尽
+            Exception: 检索页未出现检索框
+        """
+        page.goto(
+            self.SEARCH_URL,
+            wait_until="domcontentloaded",
+            timeout=self._bounded_timeout(30000, stage)
+        )
+        poll_deadline = time.monotonic() + 20
+        while time.monotonic() < poll_deadline:
+            self._check_deadline(stage)
+            if self._check_captcha(page):
+                self._wait_for_captcha(page)
+                page.goto(
+                    self.SEARCH_URL,
+                    wait_until="domcontentloaded",
+                    timeout=self._bounded_timeout(30000, stage)
+                )
+                continue
+            if self._search_box_visible(page):
+                return
+            time.sleep(0.5)
+        
+        if not self._search_box_visible(page):
+            raise Exception(
+                "知网检索页未出现检索框，可能是页面结构变化或当前网络无法访问知网，请稍后重试"
+            )
+
+    # 需要人工介入时交给调用方的可执行提示：说明去哪操作、操作后怎么办、为什么不会重复
+    CAPTCHA_HINT = (
+        "知网要求完成滑块验证，自动验证未通过或未启用。请在已打开的浏览器窗口中手动拖动滑块完成验证，"
+        "然后重新调用本工具即可继续检索（验证结果会保存在本地浏览器资料目录中，后续调用不再重复验证）。"
+    )
+
+    def _wait_for_captcha(self, page: Page, max_wait: int = 0) -> bool:
+        """处理验证码：在调用预算内自动重试，失败则立即抛出可执行提示
+        
+        不再无限等待人工操作。等待期间 Playwright 线程被独占，调用方只能等到超时，
+        后续调用还会继续排队；把「需要人工」作为明确的失败结果交回调用方更快也更可读。
         
         Args:
             page: Playwright 页面对象
-            max_wait: 最大等待时间（秒），0 表示无限等待
+            max_wait: 兼容旧签名的保留参数，实际等待由调用预算决定
             
         Returns:
-            bool: 验证是否成功
+            bool: 验证是否成功（失败时抛异常，不返回 False）
         """
-        # 检查是否启用自动验证
+        self._check_deadline("验证码处理")
+        config = ConfigManager.get_instance()
+        wait_after_complete_min = config.get_delay('captcha_wait_after_complete_min', 2.0)
+        wait_after_complete_max = config.get_delay('captcha_wait_after_complete_max', 3.0)
+
         auto_verify_enabled = get_captcha('auto_verify', False)
-        safe_print(f"[验证码处理] auto_verify_enabled: {auto_verify_enabled}")
-        safe_print(f"[验证码处理] auto_verify_with_retry 可用: {auto_verify_with_retry is not None}")
         
         if auto_verify_enabled and auto_verify_with_retry:
-            safe_print("\n" + "=" * 60)
-            safe_print("[!] 检测到安全验证（拼图验证码）")
-            safe_print("[*] 启用自动验证模式")
-            safe_print("=" * 60)
+            safe_print("[!] 检测到安全验证（拼图验证码），启用自动验证")
             
-            # 获取自动验证配置
             max_retry = get_captcha('max_retry', 3)
             drag_duration = get_captcha('drag_duration', 1.0)
             verify_method = get_captcha('verify_method', 'iou')
             
-            safe_print(f"\n    自动验证配置：")
-            safe_print(f"    - 最大重试次数: {max_retry}")
-            safe_print(f"    - 拖拽时长: {drag_duration}秒")
-            safe_print(f"    - 验证方法: {verify_method}")
-            safe_print("\n    正在进行自动验证...")
-            safe_print("=" * 60 + "\n")
+            # 单次自动验证实测约 30 秒，按剩余预算裁剪重试次数，避免验证吃满整个调用预算
+            remaining = self._remaining()
+            if remaining is not None:
+                max_retry = max(1, min(int(max_retry), int(remaining // 30)))
             
-            # 等待验证码完全加载
-            safe_print("[自动验证] 等待验证码元素完全加载...")
+            safe_print(f"    自动验证配置：最大重试 {max_retry} 次，拖拽 {drag_duration} 秒，方法 {verify_method}")
             
-            # 执行自动验证
             try:
                 success = auto_verify_with_retry(
                     page=page,
@@ -240,49 +397,21 @@ class CNKIBrowser:
                 )
                 
                 if success:
-                    safe_print("\n[OK] 自动验证成功！\n")
+                    safe_print("[OK] 自动验证成功")
+                    self._random_delay(wait_after_complete_min, wait_after_complete_max)
                     return True
-                else:
-                    safe_print("\n[X] 自动验证失败，切换到手动验证模式\n")
+                safe_print("[X] 自动验证失败，需要人工完成滑块验证")
+            except DeadlineExceeded:
+                raise
             except Exception as e:
-                safe_print(f"\n[X] 自动验证过程出错：{str(e)}")
-                safe_print("[*] 切换到手动验证模式\n")
-                import traceback
-                traceback.print_exc()
+                safe_print(f"[X] 自动验证过程出错：{str(e)}")
         else:
             if not auto_verify_enabled:
                 safe_print("[验证码处理] 自动验证未启用（配置文件 captcha.auto_verify = false）")
             if auto_verify_with_retry is None:
                 safe_print("[验证码处理] 自动验证模块导入失败")
         
-        # 手动验证模式
-        config = ConfigManager.get_instance()
-        check_interval = config.get_delay('captcha_check_interval', 1.0)
-        wait_after_complete_min = config.get_delay('captcha_wait_after_complete_min', 2.0)
-        wait_after_complete_max = config.get_delay('captcha_wait_after_complete_max', 3.0)
-        
-        safe_print("\n" + "=" * 60)
-        safe_print("[!] 检测到安全验证（拼图验证码）")
-        safe_print("[*] 手动验证模式")
-        safe_print("=" * 60)
-        safe_print("\n    请在浏览器窗口中完成以下操作：")
-        safe_print("    1. 拖动滑块完成拼图验证")
-        safe_print("    2. 等待页面自动跳转")
-        safe_print("\n    等待验证完成中...（无时间限制）")
-        safe_print("=" * 60 + "\n")
-        
-        wait_count = 0
-        while True:
-            if not self._check_captcha(page):
-                safe_print("[OK] 验证完成！\n")
-                self._random_delay(wait_after_complete_min, wait_after_complete_max)
-                return True
-            time.sleep(check_interval)
-            wait_count += 1
-            if wait_count % 10 == 0:
-                safe_print(f"    等待验证中... 已等待 {wait_count * check_interval:.0f} 秒")
-        
-        return False
+        raise Exception(self.CAPTCHA_HINT)
 
     def initialize(self) -> bool:
         """初始化浏览器（带锁保护，防止重复初始化）"""
@@ -309,119 +438,43 @@ class CNKIBrowser:
             CNKIBrowser._init_state = InitState.IN_PROGRESS
             
             try:
-                safe_print("\n" + "=" * 60)
                 safe_print("[*] 初始化知网检索服务")
-                safe_print("=" * 60)
-                safe_print("\n    [1/6] 正在启动浏览器...")
+                safe_print("    [1/3] 正在启动浏览器...")
 
                 page = self._init_browser()
                 safe_print("    [OK] 浏览器启动成功")
 
-                config = ConfigManager.get_instance()
-                page_goto_timeout = config.get_timeout('page_goto_timeout', 60000)
-                page_load_wait_min = config.get_delay('page_load_wait', 2.0)
-                page_load_wait_max = page_load_wait_min + 1.0
-
-                safe_print("    [2/6] 正在打开知网首页...")
-                safe_print(f"    URL: {self.BASE_URL}")
-                page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=page_goto_timeout)
-                safe_print("    [OK] 页面加载完成")
-                
-                # 等待 1 秒让页面渲染
-                safe_print("    [3/6] 等待页面渲染（1秒）...")
-                time.sleep(1)
-                safe_print("    [OK] 等待完成")
-                
-                # 立即开始寻找验证码
-                safe_print("    [4/6] 开始寻找验证码...")
-                captcha_found = False
-                for check_attempt in range(5):
-                    safe_print(f"    检查 {check_attempt + 1}/5...")
-                    if self._check_captcha(page):
-                        captcha_found = True
-                        safe_print("\n    [!] 发现验证码！立即启动自动验证...")
-                        if not self._wait_for_captcha(page):
-                            safe_print("    [X] 初始化失败：验证超时")
-                            CNKIBrowser._init_state = InitState.FAILED
-                            return False
-                        safe_print("    [OK] 验证完成，继续初始化...")
-                        time.sleep(2)
-                        break
-                    else:
-                        safe_print(f"    第 {check_attempt + 1} 次：未发现验证码")
-                        if check_attempt < 4:
-                            time.sleep(1)
-                
-                if not captcha_found:
-                    safe_print("    [OK] 未检测到验证码，继续初始化...")
-                
-                # 等待搜索框出现
-                safe_print("    [5/6] 等待搜索框出现...")
-                try:
-                    page.wait_for_selector("#txt_search, input.search-input, #txt_SearchText", state="visible", timeout=10000)
-                    safe_print("    [OK] 搜索框已出现")
-                except Exception as e:
-                    safe_print(f"    [!] 警告：搜索框未出现 ({e})")
-                    time.sleep(2)
-
-                max_attempts = 5
-                safe_print("    [6/6] 最后检查...")
-                for attempt in range(max_attempts):
-                    # 最后再检查一次验证码
-                    if self._check_captcha(page):
-                        safe_print("\n    [!] 再次检测到验证码...")
-                        if not self._wait_for_captcha(page):
-                            safe_print("    [X] 初始化失败：验证超时")
-                            CNKIBrowser._init_state = InitState.FAILED
-                            return False
-                        time.sleep(2)
-                        continue
-
-                    try:
-                        search_input = page.locator("input[type='text'], input.search-input, #txt_SearchText, .search-input").first
-                        if search_input and search_input.is_visible(timeout=3000):
-                            safe_print("    [OK] 页面加载成功，检测到搜索框")
-                            break
-                    except Exception:
-                        pass
-
-                    if attempt < max_attempts - 1:
-                        safe_print(f"    等待页面加载... ({attempt + 1}/{max_attempts})")
-                        time.sleep(2)
-                        if self._check_captcha(page):
-                            safe_print("\n    [!] 检测到安全验证，请完成验证...")
-                            if not self._wait_for_captcha(page):
-                                safe_print("    [X] 初始化失败：验证超时")
-                                CNKIBrowser._init_state = InitState.FAILED
-                                return False
-                            time.sleep(2)
-
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=5000)
-                except Exception:
-                    pass
+                # 直连检索页：知网首页会经过多次重定向才落地，直连可省掉首页整段加载。
+                # 未通过验证的会话会被重定向到滑块验证页，_open_search_page 会一并处理。
+                safe_print(f"    [2/3] 正在打开知网检索页：{self.SEARCH_URL}")
+                safe_print("    [3/3] 等待检索框就绪...")
+                self._open_search_page(page, "初始化")
 
                 self._ready = True
                 CNKIBrowser._init_state = InitState.COMPLETED
 
-                safe_print("\n" + "=" * 60)
-                safe_print("[OK] 知网检索服务初始化完成！")
-                safe_print("    浏览器窗口将保持打开，后续查询将复用此会话")
-                safe_print("=" * 60 + "\n")
+                safe_print("[OK] 知网检索服务初始化完成，浏览器窗口保持打开，后续查询复用此会话")
                 return True
 
+            except DeadlineExceeded:
+                safe_print("    [X] 初始化超时：已达到本次调用预算")
+                CNKIBrowser._init_state = InitState.FAILED
+                raise
             except Exception as e:
                 safe_print(f"    [X] 初始化失败：{str(e)}")
-                import traceback
-                traceback.print_exc()
                 CNKIBrowser._init_state = InitState.FAILED
-                return False
+                # 把具体原因抛回调用方，让使用者看到可执行的下一步，而不是笼统的「初始化失败」
+                raise Exception(f"知网初始化失败：{str(e)}")
 
     def is_ready(self) -> bool:
         return self._ready and self._page is not None
 
     def _reset_on_timeout(self):
-        """超时后的浏览器状态恢复机制"""
+        """超时后的浏览器状态恢复机制
+        
+        本方法在浏览器线程中排队执行，只会在上一次调用交还线程后运行；
+        恢复动作使用固定短超时，不依赖协作式截止时间。
+        """
         safe_print("[RECOVERY] 尝试恢复浏览器状态...")
         try:
             if not self._page:
@@ -440,13 +493,13 @@ class CNKIBrowser:
             except Exception:
                 pass
             
-            # 2. 回到首页
+            # 2. 回到检索页，保证下一次调用有可用的检索框
             try:
-                self._page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=10000)
+                self._page.goto(self.SEARCH_URL, wait_until="domcontentloaded", timeout=10000)
                 self._random_delay(2, 3)
-                safe_print("  已回到首页")
+                safe_print("  已回到检索页")
             except Exception as e:
-                safe_print(f"  回到首页失败：{e}")
+                safe_print(f"  回到检索页失败：{e}")
             
             safe_print("[RECOVERY] 浏览器状态已重置")
         except Exception as e:
@@ -772,6 +825,9 @@ class CNKIBrowser:
         try:
             safe_print(f"正在设置每页显示数量：{current_size} → {page_size}...")
             
+            # 切换前的结果集指纹：重载期间旧结果仍然可见，需要靠指纹变化判断是否真的刷新
+            before_fingerprint = self._result_fingerprint(self._page)
+            
             # 1. 点击下拉菜单
             dropdown = self._page.locator("#perPageDiv .sort-default").first
             if not dropdown or not dropdown.is_visible(timeout=2000):
@@ -791,14 +847,18 @@ class CNKIBrowser:
             option.click()
             safe_print(f"已点击选项：{page_size}")
             
-            # 3. 等待页面重新加载：优先用 wait_for_selector，而非固定睡眠
-            try:
-                self._page.wait_for_selector(
-                    "table.result-table-list tbody tr",
-                    state="visible",
-                    timeout=int(page_size_change_delay_max * 1000 * 3)
-                )
-            except Exception:
+            # 3. 等待结果集真的刷新：行数或首行标题变化才算重载完成，
+            #    只等结果元素出现会立刻命中切换前的旧结果
+            refreshed = self._wait_for_result_refresh(
+                self._page,
+                before_fingerprint,
+                self._bounded_timeout(
+                    int(page_size_change_delay_max * 1000 * 3), "等待每页数量生效"
+                ),
+                "等待每页数量生效"
+            )
+            if not refreshed:
+                safe_print("警告：未确认结果集已刷新，按当前页面状态继续校验")
                 self._random_delay(page_size_change_delay_min, page_size_change_delay_max)
             
             # 4. 验证设置是否成功
@@ -819,6 +879,8 @@ class CNKIBrowser:
             safe_print(f"设置后验证失败：期望 {page_size}，实际 {new_size}")
             return False
             
+        except DeadlineExceeded:
+            raise
         except Exception as e:
             safe_print(f"设置每页显示数量失败：{str(e)}")
             return False
@@ -865,7 +927,7 @@ class CNKIBrowser:
             
             # 等待新页面加载完成（事件驱动，不固定睡眠）
             safe_print("等待页面加载...")
-            if self._wait_for_page_loaded(timeout=20000):
+            if self._wait_for_page_loaded(timeout=self._bounded_timeout(20000, "等待翻页加载")):
                 new_page, _ = self._extract_page_info()
                 safe_print(f"加载后页码: {new_page}/{total_pages}")
                 
@@ -888,10 +950,10 @@ class CNKIBrowser:
                 safe_print("页面加载超时")
                 return False
             
+        except DeadlineExceeded:
+            raise
         except Exception as e:
             safe_print(f"翻页失败：{str(e)}")
-            import traceback
-            traceback.print_exc()
             return False
     
     def prev_page(self) -> bool:
@@ -936,7 +998,7 @@ class CNKIBrowser:
             
             # 等待新页面加载完成（事件驱动，不固定睡眠）
             safe_print("等待页面加载...")
-            if self._wait_for_page_loaded(timeout=20000):
+            if self._wait_for_page_loaded(timeout=self._bounded_timeout(20000, "等待翻页加载")):
                 new_page, _ = self._extract_page_info()
                 safe_print(f"加载后页码: {new_page}/{total_pages}")
                 
@@ -959,10 +1021,10 @@ class CNKIBrowser:
                 safe_print("页面加载超时")
                 return False
             
+        except DeadlineExceeded:
+            raise
         except Exception as e:
             safe_print(f"翻页失败：{str(e)}")
-            import traceback
-            traceback.print_exc()
             return False
 
     def switch_search_type(self, page: Page, search_type: SearchType) -> bool:
@@ -1044,50 +1106,108 @@ class CNKIBrowser:
             safe_print(f"筛选失败：{str(e)}")
             return False
     
+    def _first_visible_locator(self, page: Page, selectors: str):
+        """按顺序返回第一个可见元素的定位器，全部不可见时返回 None"""
+        for sel in [s.strip() for s in selectors.split(',') if s.strip()]:
+            try:
+                locator = page.locator(sel).first
+                if locator.is_visible():
+                    return locator
+            except Exception:
+                continue
+        return None
+
+    def _result_fingerprint(self, page: Page) -> str:
+        """当前结果集的指纹（行数 + 首行标题），用于判断结果是否真的刷新过
+        
+        选择器与解析结果时用的候选集保持一致：只盯一种结果容器时，换一种结果版式
+        会让指纹永远不变，白等一整段超时。
+        """
+        try:
+            return page.evaluate(
+                """
+                () => {
+                    const rows = document.querySelectorAll(
+                        'table.result-table-list tbody tr, #gridTable .result-tr, .result-table-list tr, .s-single-result, .article-item, .list-item'
+                    );
+                    const first = rows.length ? (rows[0].innerText || '').slice(0, 80) : '';
+                    return rows.length + '|' + first;
+                }
+                """
+            ) or ""
+        except Exception:
+            return ""
+
+    def _wait_for_result_refresh(self, page: Page, before: str, timeout_ms: int, stage: str) -> bool:
+        """等待结果集相对 before 发生变化
+        
+        页面重载期间上一次的结果仍然挂在 DOM 上，只判断「结果元素是否可见」会立刻命中
+        旧结果，把上一次的检索结果当成本次结果返回。
+        """
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            self._check_deadline(stage)
+            current = self._result_fingerprint(page)
+            if current and current != before:
+                return True
+            time.sleep(0.3)
+        return False
+
+    def _wait_for_search_result(self, page: Page, before: str, timeout_ms: int) -> bool:
+        """等待本次检索结果落地：结果集指纹变化，或出现「无结果」提示"""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            self._check_deadline("等待检索结果")
+            current = self._result_fingerprint(page)
+            if current and current != before:
+                return True
+            if self._any_visible(page, self.NO_RESULT_SELECTORS):
+                return True
+            time.sleep(0.3)
+        return False
+
     def search(self, request: CNKIQueryRequest) -> CNKIQueryResult:
         if not self.is_ready():
             if not self.initialize():
                 raise Exception("服务未初始化，请先完成验证")
 
         config = ConfigManager.get_instance()
-        page_goto_timeout = config.get_timeout('page_goto_timeout', 60000)
-        page_load_wait_min = config.get_delay('page_load_wait', 2.0)
-        page_load_wait_max = page_load_wait_min + 1.0
         click_delay_min = config.get_delay('click_delay_min', 0.3)
         click_delay_max = config.get_delay('click_delay_max', 0.5)
         input_delay = config.get_delay('input_delay', 50)
-        search_result_wait_min = config.get_delay('search_result_wait_min', 1.0)
-        search_result_wait_max = config.get_delay('search_result_wait_max', 2.0)
-        filter_delay_min = config.get_delay('option_click_delay_min', 1.0)
-        filter_delay_max = config.get_delay('option_click_delay_max', 2.0)
 
         page = self._page
         
         try:
-            safe_print(f"\n正在执行检索：{request.keyword}...")
+            safe_print(f"正在执行检索：{request.keyword}")
             safe_print(f"搜索类型：{SEARCH_TYPE_NAMES.get(request.search_type, request.search_type.value)}")
             
-            # 访问知网首页，使用 domcontentloaded 而非 networkidle 避免长时间等待
-            safe_print("正在访问知网首页...")
-            page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=page_goto_timeout)
-            # 等待搜索框出现，而非固定延迟
-            try:
-                page.wait_for_selector("#txt_search", state="visible", timeout=10000)
-            except Exception:
-                self._random_delay(page_load_wait_min, page_load_wait_max)
+            # 每次都直连检索页：停留在上一次的结果页时，等待结果的选择器会被旧结果立刻命中，
+            # 导致把上一次的检索结果当成本次结果返回。直连检索页也避开了首页那段重定向链。
+            safe_print(f"直连检索页：{self.SEARCH_URL}")
+            self._open_search_page(page, "检索")
             
+            self._check_deadline("检索")
             if self._check_captcha(page):
-                if not self._wait_for_captcha(page):
-                    raise Exception("验证超时，请重试")
+                self._wait_for_captcha(page)
+                # 验证通过后页面可能停在验证来源页，重新打开检索页再填关键词
+                if not self._search_box_visible(page):
+                    self._open_search_page(page, "检索")
             
             # 填写搜索关键词
-            safe_print("正在填写搜索框...")
-            search_input = page.locator("#txt_search").first
-            search_input.click()
+            search_input = self._first_visible_locator(page, self.SEARCH_BOX_SELECTORS)
+            if search_input is None:
+                raise Exception("未找到可用的知网检索框，页面结构可能已变化")
+            search_input.click(timeout=self._bounded_timeout(5000, "点击检索框"))
             self._random_delay(click_delay_min, click_delay_max)
             search_input.fill("")
             self._random_delay(click_delay_min, click_delay_max)
-            search_input.type(request.keyword, delay=int(input_delay))
+            # 逐字输入较长的关键词需要更多时间，显式给超时，避免撞上页面默认超时
+            search_input.type(
+                request.keyword,
+                delay=int(input_delay),
+                timeout=self._bounded_timeout(30000, "填写检索关键词")
+            )
             self._random_delay(0.5, 1)
             
             # 如果需要切换搜索类型，在搜索前切换
@@ -1095,26 +1215,22 @@ class CNKIBrowser:
                 self.switch_search_type(page, request.search_type)
             
             # 点击搜索按钮
-            search_btn = page.locator("input.search-btn").first
-            search_btn.click()
+            search_btn = self._first_visible_locator(page, self.SEARCH_BTN_SELECTORS)
+            if search_btn is None:
+                raise Exception("未找到可用的知网检索按钮，页面结构可能已变化")
+            before_fingerprint = self._result_fingerprint(page)
+            search_btn.click(timeout=self._bounded_timeout(5000, "点击检索按钮"))
             safe_print("已点击搜索按钮")
             
-            # 等待搜索结果加载：「有结果」或「无结果提示」任意一个出现即返回，不串行等待
-            # 合并所有可能出现的元素为一个选择器，彻底避免多次超时叠加
-            RESULT_OR_EMPTY_SELECTOR = (
-                "span.pagerTitleCell, "       # 有结果时的分页标题（最可靠）
-                "p.no-content, "              # 知网真实无结果提示
-                "table.result-table-list, "   # 结果表格
-                "a[href*='kcms'], "           # 结果链接
-                ".tips-nodata, "              # 其他无结果提示
-                ".no-result"
+            # 等待本次检索的结果真正落地：结果集指纹相对点击前发生变化，或出现无结果提示
+            result_loaded = self._wait_for_search_result(
+                page,
+                before_fingerprint,
+                self._bounded_timeout(20000, "等待检索结果")
             )
-            result_loaded = False
-            try:
-                page.wait_for_selector(RESULT_OR_EMPTY_SELECTOR, state="visible", timeout=20000)
-                result_loaded = True
-                safe_print("检测到结果页元素（有结果或无结果提示）")
-            except Exception:
+            if result_loaded:
+                safe_print("本次检索结果已加载")
+            else:
                 safe_print("警告：等待搜索结果超时，继续尝试解析")
 
             # 快速判断是否为无结果，是则提前返回空结果，不再执行后续解析
@@ -1135,49 +1251,49 @@ class CNKIBrowser:
 
             # 检查验证码（等待结果后再检查一次）
             if self._check_captcha(page):
-                if not self._wait_for_captcha(page):
-                    raise Exception("验证超时，请重试")
+                self._wait_for_captcha(page)
             
             if not result_loaded:
                 safe_print("警告：搜索结果可能未完全加载")
+            
+            self._check_deadline("检索")
             
             # 如果需要设置每页显示数量
             if request.page_size != self.get_current_page_size():
                 safe_print(f"需要调整每页显示数量为 {request.page_size} 条...")
                 if not self.set_page_size(request.page_size):
                     safe_print("警告：设置每页显示数量失败，将使用当前设置")
-                # set_page_size 内部已用 wait_for_selector 等待，无需额外延迟
+                # set_page_size 内部会等结果集指纹变化，确认页面已按新数量刷新
             
             # 如果需要筛选资源类型
             if request.filter_resource:
+                self._check_deadline("资源类型筛选")
+                before_filter = self._result_fingerprint(page)
                 if self.filter_by_resource(page, request.filter_resource):
-                    # 筛选后：用合并选择器同时等待「有结果」或「无结果提示」，任意一个出现即返回
-                    try:
-                        page.wait_for_selector(
-                            RESULT_OR_EMPTY_SELECTOR,
-                            state="visible",
-                            timeout=15000
-                        )
-                        safe_print("筛选后检测到结果页元素")
-                    except Exception:
-                        safe_print("警告：筛选后结果可能未完全加载")
+                    # 筛选同样要等结果集真的变化：筛选期间旧结果仍在页面上
+                    if not self._wait_for_result_refresh(
+                        page,
+                        before_filter,
+                        self._bounded_timeout(15000, "等待筛选结果"),
+                        "等待筛选结果"
+                    ):
+                        if not self._any_visible(page, self.NO_RESULT_SELECTORS):
+                            safe_print("警告：筛选后结果可能未完全加载")
+                    else:
+                        safe_print("筛选后结果已刷新")
                     # 检查筛选后是否无结果，提前返回
-                    try:
-                        no_content = page.locator("p.no-content").first
-                        if no_content.is_visible(timeout=500):
-                            msg = no_content.inner_text(timeout=500).strip()
-                            safe_print(f"[无结果] 筛选后知网返回空页面：{msg}")
-                            return CNKIQueryResult(
-                                total=0,
-                                page_num=request.page_num,
-                                page_size=request.page_size,
-                                category_counts={},
-                                results=[]
-                            )
-                    except Exception:
-                        pass
+                    if self._any_visible(page, self.NO_RESULT_SELECTORS):
+                        safe_print("[无结果] 筛选后知网返回空页面")
+                        return CNKIQueryResult(
+                            total=0,
+                            page_num=request.page_num,
+                            page_size=request.page_size,
+                            category_counts={},
+                            results=[]
+                        )
 
             safe_print("正在解析检索结果...")
+            self._check_deadline("解析检索结果")
             # 获取实际的每页显示数量
             actual_page_size = self.get_current_page_size()
             
@@ -1196,7 +1312,7 @@ class CNKIBrowser:
                 safe_print("标准解析失败，尝试备用解析方法...")
                 results = self._try_alternative_parse(page, actual_page_size)
 
-            safe_print(f"检索完成，总数 {total_count} 条，当前页获取 {len(results)} 条\n")
+            safe_print(f"检索完成，总数 {total_count} 条，当前页获取 {len(results)} 条")
             return CNKIQueryResult(
                 total=total_count,  # 使用知网的真实总数
                 page_num=request.page_num,
@@ -1205,6 +1321,9 @@ class CNKIBrowser:
                 results=results
             )
 
+        except DeadlineExceeded:
+            # 协作式预算到期必须原样抛回，才能让调用方及时拿到结果并释放线程
+            raise
         except TimeoutError as e:
             raise Exception(f"页面加载超时：{str(e)}")
         except Exception as e:
@@ -1385,8 +1504,13 @@ class CNKIBrowser:
             can_download=bool(download_url)
         )
 
-    def get_paper_detail(self, paper_url: str) -> Optional[CNKIPaper]:
-        """获取文章详细信息，包括摘要、关键词、引用格式等"""
+    def get_paper_detail(self, paper_url: str, page: Optional[Page] = None) -> Optional[CNKIPaper]:
+        """获取文章详细信息，包括摘要、关键词、引用格式等
+        
+        Args:
+            paper_url: 文章详情页地址
+            page: 使用哪个页面打开详情；批量获取时传入独立标签页，避免把结果页带走
+        """
         if not self.is_ready():
             if not self.initialize():
                 raise Exception("服务未初始化，请先完成验证")
@@ -1399,23 +1523,38 @@ class CNKIBrowser:
         page_load_wait_min = config.get_delay('page_load_wait', 2.0)
         page_load_wait_max = page_load_wait_min + 1.0
 
-        page = self._page
+        page = page or self._page
         paper = CNKIPaper(link=paper_url)
         
         try:
-            safe_print(f"\n正在获取文章详情：{paper_url}")
+            safe_print(f"正在获取文章详情：{paper_url}")
             # 使用 domcontentloaded 代替 networkidle，避免等待所有资源加载完毕
-            page.goto(paper_url, wait_until="domcontentloaded", timeout=page_goto_timeout)
+            page.goto(
+                paper_url,
+                wait_until="domcontentloaded",
+                timeout=self._bounded_timeout(min(page_goto_timeout, 30000), "打开详情页")
+            )
             
             # 等待关键内容出现，而非固定延迟
             try:
-                page.wait_for_selector(".wx-tit h1, div.doc h1, h1", timeout=8000)
+                page.wait_for_selector(
+                    ".wx-tit h1, div.doc h1, h1",
+                    timeout=self._bounded_timeout(8000, "等待详情页标题")
+                )
+            except DeadlineExceeded:
+                raise
             except Exception:
                 pass
             
             if self._check_captcha(page):
-                if not self._wait_for_captcha(page):
-                    raise Exception("验证超时，请重试")
+                self._wait_for_captcha(page)
+                # 验证通过后页面可能停在验证来源页，重新打开详情页再解析
+                if "kcms" not in page.url:
+                    page.goto(
+                        paper_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._bounded_timeout(min(page_goto_timeout, 30000), "打开详情页")
+                    )
             
             self._random_delay(1.0, 1.5)
             
@@ -1424,13 +1563,13 @@ class CNKIBrowser:
             safe_print("正在获取引用格式...")
             paper = self._get_citation_formats(page, paper)
             
-            safe_print("[OK] 文章详情获取完成\n")
+            safe_print("[OK] 文章详情获取完成")
             return paper
 
+        except DeadlineExceeded:
+            raise
         except Exception as e:
             safe_print(f"[X] 获取文章详情失败：{str(e)}")
-            import traceback
-            traceback.print_exc()
             return None
 
     def _parse_paper_detail(self, page: Page, paper_url: str) -> CNKIPaper:
@@ -1762,16 +1901,37 @@ class CNKIBrowser:
 
         try:
             # 1. 访问详情页
-            page.goto(paper_url, wait_until="domcontentloaded", timeout=page_goto_timeout)
+            page.goto(
+                paper_url,
+                wait_until="domcontentloaded",
+                timeout=self._bounded_timeout(min(page_goto_timeout, 30000), "打开详情页")
+            )
             # 等待下载按钮出现，而非固定延迟
             try:
-                page.wait_for_selector("#pdfDown, #cajDown, .download-btns", state="visible", timeout=8000)
+                page.wait_for_selector(
+                    "#pdfDown, #cajDown, .download-btns",
+                    state="visible",
+                    timeout=self._bounded_timeout(8000, "等待下载按钮")
+                )
+            except DeadlineExceeded:
+                raise
             except Exception:
                 self._random_delay(detail_page_load_delay_min, detail_page_load_delay_max)
 
             if self._check_captcha(page):
-                if not self._wait_for_captcha(page):
-                    return CNKIDownloadResult(success=False, message="验证码超时")
+                try:
+                    self._wait_for_captcha(page)
+                except DeadlineExceeded:
+                    raise
+                except Exception as e:
+                    return CNKIDownloadResult(success=False, format=fmt, message=str(e))
+                # 验证通过后页面可能停在验证来源页，重新打开详情页再找下载按钮
+                if "kcms" not in page.url:
+                    page.goto(
+                        paper_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._bounded_timeout(min(page_goto_timeout, 30000), "打开详情页")
+                    )
 
             # 2. 定位下载按钮
             btn_id = "#pdfDown" if fmt == "pdf" else "#cajDown"
@@ -1852,10 +2012,10 @@ class CNKIBrowser:
                     success=False, format=fmt, message=msg
                 )
 
+        except DeadlineExceeded:
+            raise
         except Exception as e:
             safe_print(f"下载失败：{str(e)}")
-            import traceback
-            traceback.print_exc()
             return CNKIDownloadResult(
                 success=False, format=fmt, message=f"下载异常：{str(e)}"
             )
@@ -1886,57 +2046,104 @@ class CNKIBrowser:
         
         all_papers = []
         pages_visited = 0
+        budget_exhausted = False
         
-        safe_print(f"\n开始批量获取，目标 {max_count} 篇，最多翻 {max_pages} 页")
-        safe_print("=" * 60)
+        # 详情放在独立标签页里取：结果页是「提交查询后才有的页面状态」，地址栏里不带查询条件，
+        # 离开后无法靠重新打开地址恢复；共用页必须留在结果页，翻页才能继续。
+        detail_page = None
+        if self._context is not None:
+            try:
+                detail_page = self._context.new_page()
+                detail_page.set_default_timeout(
+                    config.get_timeout('page_default_timeout', 15000)
+                )
+            except Exception as e:
+                safe_print(f"创建详情标签页失败，改用当前页面取详情：{e}")
+                detail_page = None
         
-        while len(all_papers) < max_count and pages_visited < max_pages:
-            # 获取当前页结果
-            current_page, total_pages = self._extract_page_info()
-            safe_print(f"\n[页 {current_page}/{total_pages}] 正在解析...")
-            
-            results = self._parse_results(self._page, page_size=20)
-            safe_print(f"  当前页找到 {len(results)} 条结果")
-            
-            # 获取详情
-            for i, paper in enumerate(results):
+        safe_print(f"开始批量获取，目标 {max_count} 篇，最多翻 {max_pages} 页")
+        
+        try:
+            while len(all_papers) < max_count and pages_visited < max_pages:
+                # 预算耗尽时保留已获取的部分结果，而不是整批作废
+                if self._remaining() is not None and self._remaining() <= 0:
+                    safe_print("已达到本次调用预算，停止继续获取")
+                    budget_exhausted = True
+                    break
+                
+                # 获取当前页结果
+                current_page, total_pages = self._extract_page_info()
+                safe_print(f"[页 {current_page}/{total_pages}] 正在解析...")
+                
+                results = self._parse_results(self._page, page_size=20)
+                safe_print(f"  当前页找到 {len(results)} 条结果")
+                
+                # 获取详情
+                for paper in results:
+                    if len(all_papers) >= max_count:
+                        break
+                    
+                    remaining = self._remaining()
+                    if remaining is not None and remaining <= 0:
+                        safe_print("已达到本次调用预算，停止继续获取详情")
+                        budget_exhausted = True
+                        break
+                    
+                    if paper.link:
+                        safe_print(f"  [{len(all_papers)+1}/{max_count}] {paper.title[:40]}...")
+                        try:
+                            detail = self.get_paper_detail(paper.link, page=detail_page)
+                        except DeadlineExceeded:
+                            budget_exhausted = True
+                            break
+                        if detail:
+                            all_papers.append(detail)
+                        self._random_delay(batch_operation_delay_min, batch_operation_delay_max)
+                
+                if budget_exhausted:
+                    break
+                
+                # 检查是否需要翻页
                 if len(all_papers) >= max_count:
                     break
                 
-                if paper.link:
-                    safe_print(f"  [{len(all_papers)+1}/{max_count}] {paper.title[:40]}...")
-                    detail = self.get_paper_detail(paper.link)
-                    if detail:
-                        all_papers.append(detail)
-                    self._random_delay(batch_operation_delay_min, batch_operation_delay_max)
-            
-            # 检查是否需要翻页
-            if len(all_papers) >= max_count:
-                break
-            
-            pages_visited += 1
-            if pages_visited >= max_pages:
-                break
-            
-            # 翻到下一页
-            if current_page < total_pages:
-                safe_print(f"\n准备翻到下一页...")
-                if not self.next_page():
-                    safe_print("无法翻页，停止批量获取")
+                pages_visited += 1
+                if pages_visited >= max_pages:
                     break
-            else:
-                safe_print("已到最后一页")
-                break
+                
+                # 翻到下一页
+                if current_page < total_pages:
+                    safe_print("准备翻到下一页...")
+                    try:
+                        advanced = self.next_page()
+                    except DeadlineExceeded:
+                        # 与取详情一致：预算用完时保留已获取的部分结果
+                        safe_print("已达到本次调用预算，停止翻页")
+                        budget_exhausted = True
+                        break
+                    if not advanced:
+                        safe_print("无法翻页，停止批量获取")
+                        break
+                else:
+                    safe_print("已到最后一页")
+                    break
+        finally:
+            if detail_page is not None:
+                try:
+                    detail_page.close()
+                except Exception:
+                    pass
         
-        safe_print("\n" + "=" * 60)
-        safe_print(f"批量获取完成！共获取 {len(all_papers)} 篇")
-        safe_print("=" * 60 + "\n")
+        if budget_exhausted:
+            safe_print(f"批量获取提前结束（预算耗尽），已获取 {len(all_papers)} 篇")
+        else:
+            safe_print(f"批量获取完成，共获取 {len(all_papers)} 篇")
         return all_papers
 
     def _cleanup(self):
-        if self._browser:
+        if self._context:
             try:
-                self._browser.close()
+                self._context.close()
             except Exception:
                 pass
         if self._playwright:
@@ -1944,7 +2151,7 @@ class CNKIBrowser:
                 self._playwright.stop()
             except Exception:
                 pass
-        self._browser = None
+        self._context = None
         self._page = None
         self._playwright = None
         self._ready = False

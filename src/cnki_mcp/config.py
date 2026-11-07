@@ -93,7 +93,8 @@ class ConfigManager:
                 "captcha_wait_after_complete_max": 3.0,
             },
             "timeouts": {
-                "page_goto_timeout": 60000,
+                "page_goto_timeout": 30000,
+                "page_default_timeout": 15000,
                 "page_load_state_timeout": 5000,
                 "element_visible_timeout": 2000,
                 "element_click_timeout": 3000,
@@ -109,6 +110,8 @@ class ConfigManager:
                 "enable_headless": False,
                 "viewport_width": 1920,
                 "viewport_height": 1080,
+                # 留空表示使用 ~/.cnki-mcp/browser-profile
+                "user_data_dir": "",
             },
             "detection": {
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -118,7 +121,7 @@ class ConfigManager:
             },
             "captcha": {
                 "auto_verify": True,
-                "max_retry": 10,
+                "max_retry": 3,
                 "drag_duration": 0.5,
                 "verify_method": "iou",
             }
